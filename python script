@@ -1,0 +1,100 @@
+import numpy as np
+from scipy.stats import norm
+from scipy.optimize import brentq
+
+# -----------------------
+# Monte Carlo Heston Simulation (Clamped)
+# -----------------------
+def heston_mc_price(S0, K, T, r, v0, kappa, theta, sigma, rho, n_paths=10000, n_steps=100):
+    dt = T / n_steps
+    S = np.full(n_paths, S0)
+    v = np.full(n_paths, v0)
+
+    for _ in range(n_steps):
+        z1 = np.random.normal(size=n_paths)
+        z2 = np.random.normal(size=n_paths)
+        dW1 = z1
+        dW2 = rho * z1 + np.sqrt(1 - rho ** 2) * z2
+
+        v = np.clip(v + kappa * (theta - v) * dt + sigma * np.sqrt(np.maximum(v, 0)) * np.sqrt(dt) * dW2, 0, None)
+        S = S * np.exp((r - 0.5 * v) * dt + np.sqrt(v) * np.sqrt(dt) * dW1)
+
+    call_payoffs = np.maximum(S - K, 0)
+    mc_price = np.exp(-r * T) * np.mean(call_payoffs)
+
+    # Clamp to intrinsic value + buffer to avoid IV inversion failures
+    intrinsic = max(S0 - K * np.exp(-r * T), 0)
+    return np.clip(mc_price, intrinsic, S0)
+
+# -----------------------
+# Black-Scholes Call Price
+# -----------------------
+def black_scholes_call_price(S, K, T, r, sigma):
+    if sigma <= 0 or T <= 0:
+        return max(S - K, 0.0)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+
+# -----------------------
+# Implied Volatility via Brent
+# -----------------------
+def implied_vol_call(price, S, K, T, r, tol=1e-6):
+    try:
+        return brentq(
+            lambda sigma: black_scholes_call_price(S, K, T, r, sigma) - price,
+            1e-6, 5.0, xtol=tol
+        )
+    except ValueError:
+        print(f"[DEBUG] IV inversion failed: price={price:.5f}, K={K}, T={T:.3f}")
+        return np.nan
+
+# -----------------------
+# Heston IV Surface Using Monte Carlo
+# -----------------------
+def heston_mc_iv_surface(S0, r, v0, kappa, theta, sigma, rho, expiries, strikes):
+    surface = np.zeros((len(expiries), len(strikes)))
+    for i, T in enumerate(expiries):
+        for j, K in enumerate(strikes):
+            price = heston_mc_price(S0, K, T, r, v0, kappa, theta, sigma, rho)
+            if price < 1e-6 or price > S0:
+                print(f"[DEBUG] Skipping IV: invalid MC price={price:.5f}, K={K}, T={T:.3f}")
+                surface[i, j] = np.nan
+            else:
+                iv = implied_vol_call(price, S0, K, T, r)
+                surface[i, j] = iv if iv > 1e-4 else np.nan
+    return surface
+
+# -----------------------
+# Example Usage with Clean Output
+# -----------------------
+if __name__ == "__main__":
+    # Model Parameters
+    S0 = 500
+    r = 0.01
+    v0 = 0.04
+    kappa = 2.0
+    theta = 0.04
+    sigma = 0.5
+    rho = -0.7
+
+    # Strike and Expiry Grid
+    strikes = np.arange(470, 531, 10)
+    expiries = [7/365, 30/365, 60/365, 90/365, 180/365, 365/365]
+
+    # Generate IV Surface
+    iv_surface = heston_mc_iv_surface(S0, r, v0, kappa, theta, sigma, rho, expiries, strikes)
+
+    # Print Detailed Output with IV as Percent
+    print("\nDetailed Heston Monte Carlo Option Prices and IVs (%):\n")
+    print(f"{'Strike':>8} {'Days':>6} {'Price':>10} {'IV (%)':>10}")
+
+    for i, T in enumerate(expiries):
+        days = int(round(T * 365))
+        for j, K in enumerate(strikes):
+            price = heston_mc_price(S0, K, T, r, v0, kappa, theta, sigma, rho)
+            iv = iv_surface[i][j]
+            if np.isnan(iv):
+                print(f"{K:>8} {days:>6} {price:>10.4f} {'(nan)':>10}")
+            else:
+                print(f"{K:>8} {days:>6} {price:>10.4f} {iv * 100:>10.2f}")
